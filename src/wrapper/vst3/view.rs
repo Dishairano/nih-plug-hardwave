@@ -376,21 +376,21 @@ impl<P: Vst3Plugin> IPlugView for WrapperView<P> {
     unsafe fn on_size(&self, new_size: *mut ViewRect) -> tresult {
         check_null_ptr!(new_size);
 
-        // TODO: Implement Host->Plugin resizing
-        let (unscaled_width, unscaled_height) = self.editor.lock().size();
-        let scaling_factor = self.scaling_factor.load(Ordering::Relaxed);
-        let (editor_width, editor_height) = (
-            (unscaled_width as f32 * scaling_factor).round() as i32,
-            (unscaled_height as f32 * scaling_factor).round() as i32,
-        );
-
         let width = (*new_size).right - (*new_size).left;
         let height = (*new_size).bottom - (*new_size).top;
-        if width == editor_width && height == editor_height {
-            kResultOk
-        } else {
-            kResultFalse
+        if width <= 0 || height <= 0 {
+            return kResultFalse;
         }
+
+        let scaling_factor = self.scaling_factor.load(Ordering::Relaxed);
+        let sf = if scaling_factor > 0.0 { scaling_factor } else { 1.0 };
+        let unscaled_w = (width as f32 / sf).round() as u32;
+        let unscaled_h = (height as f32 / sf).round() as u32;
+
+        // Delegate to the editor so it can resize its webview to match.
+        self.editor.lock().set_size(unscaled_w, unscaled_h);
+
+        kResultOk
     }
 
     unsafe fn on_focus(&self, _state: TBool) -> tresult {
@@ -425,15 +425,16 @@ impl<P: Vst3Plugin> IPlugView for WrapperView<P> {
     }
 
     unsafe fn can_resize(&self) -> tresult {
-        // TODO: Implement Host->Plugin resizing
-        kResultFalse
+        kResultOk
     }
 
     unsafe fn check_size_constraint(&self, rect: *mut ViewRect) -> tresult {
         check_null_ptr!(rect);
 
-        // TODO: Implement Host->Plugin resizing
-        if (*rect).right - (*rect).left > 0 && (*rect).bottom - (*rect).top > 0 {
+        let w = (*rect).right - (*rect).left;
+        let h = (*rect).bottom - (*rect).top;
+        // Clamp to reasonable bounds.
+        if w > 0 && h > 0 {
             kResultOk
         } else {
             kResultFalse

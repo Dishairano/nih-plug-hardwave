@@ -69,11 +69,15 @@ pub trait Editor: Send {
     /// loaded.
     fn param_values_changed(&self);
 
+    /// Called by the host (via `IPlugView::onSize`) when the user drag-resizes the plugin window.
+    /// The sizes are in logical (unscaled) pixels. The editor should resize its embedded view to
+    /// fit. The default implementation is a no-op so existing editors don't need to be changed.
+    fn set_size(&self, _width: u32, _height: u32) {}
+
     // TODO: Reconsider adding a tick function here for the Linux `IRunLoop`. To keep this platform
     //       and API agnostic, add a way to ask the GuiContext if the wrapper already provides a
     //       tick function. If it does not, then the Editor implementation must handle this by
     //       itself. This would also need an associated `PREFERRED_FRAME_RATE` constant.
-    // TODO: Host->Plugin resizing
 }
 
 /// A raw window handle for platform and GUI framework agnostic editors. This implements

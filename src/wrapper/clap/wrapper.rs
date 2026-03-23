@@ -2712,25 +2712,36 @@ impl<P: ClapPlugin> Wrapper<P> {
     }
 
     unsafe extern "C" fn ext_gui_can_resize(_plugin: *const clap_plugin) -> bool {
-        // TODO: Implement Host->Plugin GUI resizing
-        false
+        true
     }
 
     unsafe extern "C" fn ext_gui_get_resize_hints(
         _plugin: *const clap_plugin,
-        _hints: *mut clap_gui_resize_hints,
+        hints: *mut clap_gui_resize_hints,
     ) -> bool {
-        // TODO: Implement Host->Plugin GUI resizing
-        false
+        if hints.is_null() {
+            return false;
+        }
+        (*hints).can_resize_horizontally = true;
+        (*hints).can_resize_vertically = true;
+        (*hints).preserve_aspect_ratio = false;
+        (*hints).aspect_ratio_width = 0;
+        (*hints).aspect_ratio_height = 0;
+        true
     }
 
     unsafe extern "C" fn ext_gui_adjust_size(
         _plugin: *const clap_plugin,
-        _width: *mut u32,
-        _height: *mut u32,
+        width: *mut u32,
+        height: *mut u32,
     ) -> bool {
-        // TODO: Implement Host->Plugin GUI resizing
-        false
+        if width.is_null() || height.is_null() {
+            return false;
+        }
+        // Clamp to sane bounds; host passes proposed size, we return accepted size.
+        *width = (*width).clamp(600, 2560);
+        *height = (*height).clamp(380, 1600);
+        true
     }
 
     unsafe extern "C" fn ext_gui_set_size(
@@ -2738,20 +2749,19 @@ impl<P: ClapPlugin> Wrapper<P> {
         width: u32,
         height: u32,
     ) -> bool {
-        // TODO: Implement Host->Plugin GUI resizing
-        // TODO: The host will also call this if an asynchronous (on Linux) resize request fails
         check_null_ptr!(false, plugin, (*plugin).plugin_data);
         let wrapper = &*((*plugin).plugin_data as *const Self);
 
-        let (unscaled_width, unscaled_height) =
-            wrapper.editor.borrow().as_ref().unwrap().lock().size();
         let scaling_factor = wrapper.editor_scaling_factor.load(Ordering::Relaxed);
-        let (editor_width, editor_height) = (
-            (unscaled_width as f32 * scaling_factor).round() as u32,
-            (unscaled_height as f32 * scaling_factor).round() as u32,
-        );
+        let sf = if scaling_factor > 0.0 { scaling_factor } else { 1.0 };
+        let unscaled_w = (width as f32 / sf).round() as u32;
+        let unscaled_h = (height as f32 / sf).round() as u32;
 
-        width == editor_width && height == editor_height
+        if let Some(editor) = wrapper.editor.borrow().as_ref() {
+            editor.lock().set_size(unscaled_w, unscaled_h);
+        }
+
+        true
     }
 
     unsafe extern "C" fn ext_gui_set_parent(
