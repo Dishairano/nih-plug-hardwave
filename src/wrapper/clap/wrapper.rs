@@ -3181,7 +3181,10 @@ impl<P: ClapPlugin> Wrapper<P> {
             nih_debug_assert_failure!("Could not allocate {} bytes to read the state.", length);
             return false;
         }
-        if !read_stream(&*stream, read_buffer.spare_capacity_mut()) {
+        // Exactly `length` bytes, not the whole spare capacity: an allocator is free to hand out
+        // more than was asked for, and reading that many bytes runs off the end of the state and
+        // fails the load.
+        if !read_stream(&*stream, &mut read_buffer.spare_capacity_mut()[..length as usize]) {
             nih_debug_assert_failure!(
                 "Error or end of stream while reading the state buffer from the stream."
             );
