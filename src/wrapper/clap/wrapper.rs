@@ -3163,7 +3163,24 @@ impl<P: ClapPlugin> Wrapper<P> {
         }
         let length = u64::from_le_bytes(length_bytes);
 
-        let mut read_buffer: Vec<u8> = Vec::with_capacity(length as usize);
+        // A damaged project file, or a stream that never held our state at all, puts an arbitrary
+        // number here. `Vec::with_capacity` on such a number aborts the whole process, which takes
+        // the host down with it, so refuse implausible sizes and let an allocation that still fails
+        // return false. Our state is JSON, optionally zstd-compressed; megabytes, never gigabytes.
+        const MAX_STATE_SIZE: u64 = 64 * 1024 * 1024;
+        if length > MAX_STATE_SIZE {
+            nih_debug_assert_failure!(
+                "The state in the stream claims to be {} bytes, which is not plausible.",
+                length
+            );
+            return false;
+        }
+
+        let mut read_buffer: Vec<u8> = Vec::new();
+        if read_buffer.try_reserve_exact(length as usize).is_err() {
+            nih_debug_assert_failure!("Could not allocate {} bytes to read the state.", length);
+            return false;
+        }
         if !read_stream(&*stream, read_buffer.spare_capacity_mut()) {
             nih_debug_assert_failure!(
                 "Error or end of stream while reading the state buffer from the stream."

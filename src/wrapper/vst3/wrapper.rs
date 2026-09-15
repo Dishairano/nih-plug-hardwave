@@ -431,9 +431,28 @@ impl<P: Vst3Plugin> IComponent for Wrapper<P> {
             return kResultFalse;
         }
 
-        let stream_byte_size = (eof_pos - current_pos) as i32;
+        // Same reasoning as the CLAP wrapper: a damaged project file can make this length absurd,
+        // and allocating on it aborts the host. Our state is JSON, megabytes at the very most.
+        const MAX_STATE_SIZE: i64 = 64 * 1024 * 1024;
+        let stream_size = eof_pos - current_pos;
+        if !(0..=MAX_STATE_SIZE).contains(&stream_size) {
+            nih_debug_assert_failure!(
+                "The state in the stream claims to be {} bytes, which is not plausible.",
+                stream_size
+            );
+            return kResultFalse;
+        }
+
+        let stream_byte_size = stream_size as i32;
         let mut num_bytes_read = 0;
-        let mut read_buffer: Vec<u8> = Vec::with_capacity(stream_byte_size as usize);
+        let mut read_buffer: Vec<u8> = Vec::new();
+        if read_buffer.try_reserve_exact(stream_byte_size as usize).is_err() {
+            nih_debug_assert_failure!(
+                "Could not allocate {} bytes to read the state.",
+                stream_byte_size
+            );
+            return kResultFalse;
+        }
         state.read(
             read_buffer.as_mut_ptr() as *mut c_void,
             read_buffer.capacity() as i32,
