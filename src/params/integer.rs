@@ -157,8 +157,9 @@ impl Param for IntParam {
     fn string_to_normalized_value(&self, string: &str) -> Option<f32> {
         let value = match &self.string_to_value {
             Some(f) => f(string.trim()),
-            // In the CLAP wrapper the unit will be included, so make sure to handle that
-            None => string.trim().trim_end_matches(self.unit).parse().ok(),
+            // The host hands back whatever we displayed, unit and all, and every parameter has to
+            // answer or CLAP counts it against all of them. See parse_displayed_number.
+            None => crate::params::parse_displayed_number(string),
         }?;
 
         Some(self.preview_normalized(value))

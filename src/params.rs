@@ -14,6 +14,41 @@ use self::internals::ParamPtr;
 pub use nih_plug_derive::Params;
 
 // Parameter types
+/// Read a number back out of text a host handed us, when the parameter has no parser of its own.
+///
+/// CLAP asks a plug-in to turn displayed text back into a value, and it wants every parameter to
+/// answer or none of them: clap-validator reports "returned true for 300 out of 400 calls" when
+/// only some do. The strict fallback (parse the whole string after trimming the unit) fails as soon
+/// as a parameter formats itself differently from its unit, which is most of ours: "60 Hz" against
+/// unit "Hz" is fine, "1.2 kHz", "-12.0 dB" and "144" are not.
+///
+/// So: take the leading number, ignore whatever trails it, and apply the one multiplier that
+/// changes the meaning of the number rather than decorating it (k for kilo). Anything with no
+/// number at the front is still refused, because guessing there would be worse than saying no.
+pub(crate) fn parse_displayed_number(text: &str) -> Option<f32> {
+    let trimmed = text.trim();
+    let mut end = 0;
+    for (i, c) in trimmed.char_indices() {
+        let keep = c.is_ascii_digit()
+            || (i == 0 && (c == '-' || c == '+'))
+            || ((c == '.' || c == ',') && i > 0);
+        if !keep {
+            break;
+        }
+        end = i + c.len_utf8();
+    }
+    if end == 0 {
+        return None;
+    }
+    // A comma is a decimal separator on half our users' keyboards.
+    let number: f32 = trimmed[..end].replace(',', ".").parse().ok()?;
+    let rest = trimmed[end..].trim_start();
+    if rest.starts_with('k') || rest.starts_with('K') {
+        return Some(number * 1000.0);
+    }
+    Some(number)
+}
+
 mod boolean;
 pub mod enums;
 mod float;
@@ -325,5 +360,36 @@ unsafe impl<P: Params> Params for Arc<P> {
 
     fn deserialize_fields(&self, serialized: &BTreeMap<String, String>) {
         self.as_ref().deserialize_fields(serialized)
+    }
+}
+
+#[cfg(test)]
+mod displayed_number_tests {
+    use super::parse_displayed_number;
+
+    #[test]
+    fn reads_the_shapes_our_plug_ins_display() {
+        assert_eq!(parse_displayed_number("60"), Some(60.0));
+        assert_eq!(parse_displayed_number("60 Hz"), Some(60.0));
+        assert_eq!(parse_displayed_number("26.173317 Hz"), Some(26.173317));
+        assert_eq!(parse_displayed_number("-12.0 dB"), Some(-12.0));
+        assert_eq!(parse_displayed_number("144°"), Some(144.0));
+        assert_eq!(parse_displayed_number("75 %"), Some(75.0));
+        assert_eq!(parse_displayed_number("400.00003 ms"), Some(400.00003));
+        // A comma is the decimal separator on half our users' keyboards.
+        assert_eq!(parse_displayed_number("1,5 s"), Some(1.5));
+    }
+
+    #[test]
+    fn kilo_changes_the_number_so_it_is_applied() {
+        assert_eq!(parse_displayed_number("1.2 kHz"), Some(1200.0));
+        assert_eq!(parse_displayed_number("5 k"), Some(5000.0));
+    }
+
+    #[test]
+    fn text_with_no_number_is_still_refused() {
+        assert_eq!(parse_displayed_number("Hall"), None);
+        assert_eq!(parse_displayed_number(""), None);
+        assert_eq!(parse_displayed_number("  dB"), None);
     }
 }
