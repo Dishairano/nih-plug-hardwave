@@ -19,7 +19,7 @@ use vst3_sys::vst::{
 use vst3_sys::VST3;
 use widestring::U16CStr;
 
-use super::inner::{ProcessEvent, WrapperInner};
+use super::inner::{ProcessEvent, Task, WrapperInner};
 use super::note_expressions::{self, NoteExpressionController};
 use super::util::{
     u16strlcpy, VstPtr, VST3_MIDI_CCS, VST3_MIDI_NUM_PARAMS, VST3_MIDI_PARAMS_START,
