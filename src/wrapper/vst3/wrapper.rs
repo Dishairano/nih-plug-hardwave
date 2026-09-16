@@ -472,6 +472,12 @@ impl<P: Vst3Plugin> IComponent for Wrapper<P> {
             Some(mut state) => {
                 if self.inner.set_state_inner(&mut state) {
                     nih_trace!("Loaded state ({} bytes)", read_buffer.len());
+                    // Tell the host the values moved, the same way the GUI path does. Without it
+                    // the host keeps showing the values from before the load.
+                    let task_posted = self.inner.schedule_gui(Task::TriggerRestart(
+                        vst3_sys::vst::RestartFlags::kParamValuesChanged as i32,
+                    ));
+                    nih_debug_assert!(task_posted, "The task queue is full, dropping task...");
                     kResultOk
                 } else {
                     kResultFalse

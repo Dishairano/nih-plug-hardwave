@@ -1826,6 +1826,24 @@ impl<P: ClapPlugin> Wrapper<P> {
         let task_posted = self.schedule_gui(Task::ParameterValuesChanged);
         nih_debug_assert!(task_posted, "The task queue is full, dropping task...");
 
+        // Tell the HOST the values moved. The task above only reaches our own editor, so without
+        // this the host keeps showing and automating the values from before the load: generic UIs,
+        // automation lanes and parameter readouts all go stale after loading a preset or a project.
+        // clap-validator reports it as "these parameter values changed without a rescan request",
+        // which every Hardwave plug-in failed on all three systems.
+        //
+        // Called straight out rather than queued: `clap_plugin_state::load` is a main-thread call,
+        // which is where rescan belongs, and a queued task only runs if the host gets around to
+        // calling `on_main_thread`, which a host loading a preset may never do.
+        if success {
+            match &*self.host_params.borrow() {
+                Some(host_params) => unsafe_clap_call! {
+                    host_params=>rescan(&*self.host_callback, CLAP_PARAM_RESCAN_VALUES)
+                },
+                None => nih_debug_assert_failure!("The host does not support parameters? What?"),
+            }
+        }
+
         // TODO: Right now there's no way to know if loading the state changed the GUI's size. We
         //       could keep track of the last known size and compare the GUI's current size against
         //       that but that also seems brittle.
