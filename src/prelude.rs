@@ -28,6 +28,9 @@ pub use crate::context::PluginApi;
 pub use crate::editor::{Editor, ParentWindowHandle};
 pub use crate::midi::sysex::SysExMessage;
 pub use crate::midi::{control_change, MidiConfig, NoteEvent, PluginNoteEvent};
+// A plug-in writing its own string_to_value parser needs the same tolerance the default has,
+// or its parameters go back to refusing text that carries a unit.
+pub use crate::params::parse_displayed_number;
 pub use crate::params::enums::{Enum, EnumParam};
 pub use crate::params::internals::ParamPtr;
 pub use crate::params::range::{FloatRange, IntRange};

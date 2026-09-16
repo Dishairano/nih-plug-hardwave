@@ -25,7 +25,7 @@ pub use nih_plug_derive::Params;
 /// So: take the leading number, ignore whatever trails it, and apply the one multiplier that
 /// changes the meaning of the number rather than decorating it (k for kilo). Anything with no
 /// number at the front is still refused, because guessing there would be worse than saying no.
-pub(crate) fn parse_displayed_number(text: &str) -> Option<f32> {
+pub fn parse_displayed_number(text: &str) -> Option<f32> {
     let trimmed = text.trim();
     let mut end = 0;
     for (i, c) in trimmed.char_indices() {
