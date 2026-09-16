@@ -3215,6 +3215,28 @@ impl<P: ClapPlugin> Wrapper<P> {
                 let success = wrapper.set_state_inner(&mut state);
                 if success {
                     nih_trace!("Loaded state ({} bytes)", read_buffer.len());
+
+                    // Tell the host to re-read every parameter. Loading a state changes values
+                    // behind the host's back, and CLAP requires a rescan to go with that; without
+                    // it the host keeps showing and automating the old values. clap-validator's
+                    // state-reproducibility tests fail on exactly this, for every Hardwave plug-in.
+                    //
+                    // Straight call, not a GUI task: clap_plugin_state::load is a main thread
+                    // function, and the queued task only runs when the host calls back, which it
+                    // may not do at all when no editor is open.
+                    match &*wrapper.host_params.borrow() {
+                        Some(host_params) => {
+                            unsafe_clap_call! {
+                                host_params=>rescan(
+                                    &*wrapper.host_callback,
+                                    CLAP_PARAM_RESCAN_VALUES,
+                                )
+                            };
+                        }
+                        None => nih_debug_assert_failure!(
+                            "The host does not support parameters? What?"
+                        ),
+                    }
                 }
 
                 success
