@@ -98,6 +98,28 @@ impl Debug for FloatParam {
 }
 
 // `Params` can not be implemented outside of NIH-plug itself because `ParamPtr` is also closed
+/// A parameter with no formatter of its own used to print the raw f32, which gave "1.2286583 ms"
+/// and, worse, text that would not survive a round trip: typing it back produced a float one bit
+/// away, which printed as "1.2286584 ms". clap-validator fails a plug-in for that, and a producer
+/// reading seven decimals of a millisecond learns nothing from the last four.
+///
+/// Six significant digits keeps every range we ship readable (1 to 2000 ms, 20 Hz to 20 kHz) and
+/// survives text -> value -> text unchanged.
+fn display_number(value: f32) -> String {
+    if value == 0.0 || !value.is_finite() {
+        return format!("{value}");
+    }
+    let magnitude = value.abs().log10().floor() as i32;
+    let decimals = (5 - magnitude).clamp(0, 6) as usize;
+    let text = format!("{value:.decimals$}");
+    // Trailing zeros are noise: 400.000 is 400.
+    if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        text
+    }
+}
+
 impl super::Sealed for FloatParam {}
 
 impl Param for FloatParam {
@@ -165,8 +187,8 @@ impl Param for FloatParam {
                 let num_digits = decimals_from_step_size(*step_size);
                 format!("{value:.num_digits$}")
             }
-            (None, None, true) => format!("{}{}", value, self.unit),
-            (None, None, false) => format!("{value}"),
+            (None, None, true) => format!("{}{}", display_number(value), self.unit),
+            (None, None, false) => display_number(value),
         }
     }
 
@@ -437,4 +459,28 @@ fn decimals_from_step_size(step_size: f32) -> usize {
     }
 
     num_digits as usize
+}
+
+#[cfg(test)]
+mod display_number_tests {
+    use super::display_number;
+
+    #[test]
+    fn keeps_the_number_readable() {
+        assert_eq!(display_number(400.0), "400");
+        assert_eq!(display_number(1.2286583), "1.22866");
+        assert_eq!(display_number(26.173317), "26.1733");
+        assert_eq!(display_number(-12.0), "-12");
+        assert_eq!(display_number(19999.5), "19999.5");
+    }
+
+    #[test]
+    fn text_survives_a_round_trip() {
+        // What the validator checks: display, parse, display again, unchanged.
+        for value in [1.2286583f32, 26.173317, 400.00003, 0.0154321, 1999.999] {
+            let once = display_number(value);
+            let parsed: f32 = once.parse().unwrap();
+            assert_eq!(once, display_number(parsed), "unstable for {value}");
+        }
+    }
 }
