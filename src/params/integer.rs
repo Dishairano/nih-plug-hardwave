@@ -159,7 +159,8 @@ impl Param for IntParam {
             Some(f) => f(string.trim()),
             // The host hands back whatever we displayed, unit and all, and every parameter has to
             // answer or CLAP counts it against all of them. See parse_displayed_number.
-            None => crate::params::parse_displayed_number(string),
+            // Integer parameters hold whole numbers, so the parsed value is rounded to one.
+            None => crate::params::parse_displayed_number(string).map(|v| v.round() as i32),
         }?;
 
         Some(self.preview_normalized(value))
