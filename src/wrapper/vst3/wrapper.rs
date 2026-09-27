@@ -10,11 +10,11 @@ use vst3_sys::base::{kInvalidArgument, kNoInterface, kResultFalse, kResultOk, tr
 use vst3_sys::base::{IBStream, IPluginBase};
 use vst3_sys::utils::SharedVstPtr;
 use vst3_sys::vst::{
-    kNoParamId, kNoParentUnitId, kNoProgramListId, kRootUnitId, Event, EventTypes, IAudioProcessor,
-    IComponent, IEditController, IEventList, IMidiMapping, INoteExpressionController,
-    IParamValueQueue, IParameterChanges, IProcessContextRequirements, IUnitInfo,
-    LegacyMidiCCOutEvent, NoteExpressionTypeInfo, NoteExpressionValueDescription, NoteOffEvent,
-    NoteOnEvent, ParameterFlags, PolyPressureEvent, ProgramListInfo, TChar, UnitInfo,
+    kNoParamId, kNoParentUnitId, kNoProgramListId, kRootUnitId, Event, EventTypes, IAttributeList,
+    IAudioProcessor, IComponent, IEditController, IEventList, IInfoListener, IMidiMapping,
+    INoteExpressionController, IParamValueQueue, IParameterChanges, IProcessContextRequirements,
+    IUnitInfo, LegacyMidiCCOutEvent, NoteExpressionTypeInfo, NoteExpressionValueDescription,
+    NoteOffEvent, NoteOnEvent, ParameterFlags, PolyPressureEvent, ProgramListInfo, TChar, UnitInfo,
 };
 use vst3_sys::VST3;
 use widestring::U16CStr;
@@ -22,7 +22,7 @@ use widestring::U16CStr;
 use super::inner::{ProcessEvent, Task, WrapperInner};
 use super::note_expressions::{self, NoteExpressionController};
 use super::util::{
-    u16strlcpy, VstPtr, VST3_MIDI_CCS, VST3_MIDI_NUM_PARAMS, VST3_MIDI_PARAMS_START,
+    self, u16strlcpy, VstPtr, VST3_MIDI_CCS, VST3_MIDI_NUM_PARAMS, VST3_MIDI_PARAMS_START,
 };
 use super::util::{VST3_MIDI_CHANNELS, VST3_MIDI_PARAMS_END};
 use super::view::WrapperView;
@@ -45,7 +45,8 @@ use vst3_sys as vst3_com;
     IMidiMapping,
     INoteExpressionController,
     IProcessContextRequirements,
-    IUnitInfo
+    IUnitInfo,
+    IInfoListener
 ))]
 pub struct Wrapper<P: Vst3Plugin> {
     inner: Arc<WrapperInner<P>>,
@@ -446,7 +447,10 @@ impl<P: Vst3Plugin> IComponent for Wrapper<P> {
         let stream_byte_size = stream_size as i32;
         let mut num_bytes_read = 0;
         let mut read_buffer: Vec<u8> = Vec::new();
-        if read_buffer.try_reserve_exact(stream_byte_size as usize).is_err() {
+        if read_buffer
+            .try_reserve_exact(stream_byte_size as usize)
+            .is_err()
+        {
             nih_debug_assert_failure!(
                 "Could not allocate {} bytes to read the state.",
                 stream_byte_size
@@ -1916,5 +1920,24 @@ impl<P: Vst3Plugin> IUnitInfo for Wrapper<P> {
         _data: SharedVstPtr<dyn IBStream>,
     ) -> tresult {
         kInvalidArgument
+    }
+}
+
+impl<P: Vst3Plugin> IInfoListener for Wrapper<P> {
+    unsafe fn set_channel_context_infos(&self, list: *mut c_void) -> tresult {
+        check_null_ptr!(list);
+
+        // SAFETY: The host passes a pointer to an `IAttributeList`, and the null case was handled
+        //         above. `shared()` takes a reference that is released when `list` is dropped at the
+        //         end of this function.
+        let list = match unsafe { vst3_sys::VstPtr::<dyn IAttributeList>::shared(list as *mut _) } {
+            Some(list) => list,
+            None => return kInvalidArgument,
+        };
+        // SAFETY: `list` is a valid attribute list for the duration of this call
+        let track_info = unsafe { util::track_info_from_attribute_list(&list) };
+        self.inner.set_track_info(track_info);
+
+        kResultOk
     }
 }

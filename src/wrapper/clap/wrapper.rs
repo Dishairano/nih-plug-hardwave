@@ -1,5 +1,6 @@
 use atomic_float::AtomicF32;
 use atomic_refcell::{AtomicRefCell, AtomicRefMut};
+use clap_sys::color::clap_color;
 use clap_sys::events::{
     clap_event_header, clap_event_midi, clap_event_midi_sysex, clap_event_note,
     clap_event_note_expression, clap_event_param_gesture, clap_event_param_mod,
@@ -22,9 +23,6 @@ use clap_sys::ext::audio_ports::{
 use clap_sys::ext::audio_ports_config::{
     clap_audio_ports_config, clap_plugin_audio_ports_config, CLAP_EXT_AUDIO_PORTS_CONFIG,
 };
-use clap_sys::ext::remote_controls::{
-    clap_plugin_remote_controls, clap_remote_controls_page, CLAP_EXT_REMOTE_CONTROLS,
-};
 use clap_sys::ext::gui::{
     clap_gui_resize_hints, clap_host_gui, clap_plugin_gui, clap_window, CLAP_EXT_GUI,
     CLAP_WINDOW_API_COCOA, CLAP_WINDOW_API_WIN32, CLAP_WINDOW_API_X11,
@@ -40,6 +38,9 @@ use clap_sys::ext::params::{
     CLAP_PARAM_IS_MODULATABLE, CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID, CLAP_PARAM_IS_READONLY,
     CLAP_PARAM_IS_STEPPED, CLAP_PARAM_RESCAN_VALUES,
 };
+use clap_sys::ext::remote_controls::{
+    clap_plugin_remote_controls, clap_remote_controls_page, CLAP_EXT_REMOTE_CONTROLS,
+};
 use clap_sys::ext::render::{
     clap_plugin_render, clap_plugin_render_mode, CLAP_EXT_RENDER, CLAP_RENDER_OFFLINE,
     CLAP_RENDER_REALTIME,
@@ -47,6 +48,10 @@ use clap_sys::ext::render::{
 use clap_sys::ext::state::{clap_plugin_state, CLAP_EXT_STATE};
 use clap_sys::ext::tail::{clap_plugin_tail, CLAP_EXT_TAIL};
 use clap_sys::ext::thread_check::{clap_host_thread_check, CLAP_EXT_THREAD_CHECK};
+use clap_sys::ext::track_info::{
+    clap_host_track_info, clap_plugin_track_info, clap_track_info, CLAP_EXT_TRACK_INFO,
+    CLAP_EXT_TRACK_INFO_COMPAT,
+};
 use clap_sys::ext::voice_info::{
     clap_host_voice_info, clap_plugin_voice_info, clap_voice_info, CLAP_EXT_VOICE_INFO,
     CLAP_VOICE_INFO_SUPPORTS_OVERLAPPING_NOTES,
@@ -60,6 +65,7 @@ use clap_sys::process::{
     CLAP_PROCESS_ERROR,
 };
 use clap_sys::stream::{clap_istream, clap_ostream};
+use clap_sys::string_sizes::CLAP_NAME_SIZE;
 use crossbeam::atomic::AtomicCell;
 use crossbeam::channel::{self, SendTimeoutError};
 use crossbeam::queue::ArrayQueue;
@@ -85,15 +91,16 @@ use crate::midi::MidiResult;
 use crate::prelude::{
     AsyncExecutor, AudioIOLayout, AuxiliaryBuffers, BufferConfig, ClapPlugin, Editor, MidiConfig,
     NoteEvent, ParamFlags, ParamPtr, Params, ParentWindowHandle, Plugin, PluginNoteEvent,
-    ProcessMode, ProcessStatus, SysExMessage, TaskExecutor, Transport,
+    ProcessMode, ProcessStatus, SysExMessage, TaskExecutor, TrackInfo, Transport,
 };
 use crate::util::permit_alloc;
 use crate::wrapper::clap::context::RemoteControlPages;
-use crate::wrapper::clap::util::{read_stream, write_stream};
+use crate::wrapper::clap::util::{read_stream, track_info_from_clap, write_stream};
 use crate::wrapper::state::{self, PluginState};
 use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
 use crate::wrapper::util::{
     clamp_input_event_timing, clamp_output_event_timing, hash_param_id, process_wrapper, strlcpy,
+    WrapperRef,
 };
 
 /// How many output parameter changes we can store in our output parameter change queue. Storing
@@ -234,6 +241,13 @@ pub struct Wrapper<P: ClapPlugin> {
     clap_plugin_state: clap_plugin_state,
 
     clap_plugin_tail: clap_plugin_tail,
+
+    clap_plugin_track_info: clap_plugin_track_info,
+    /// The host's track info extension, queried under both the final and the draft extension ID.
+    host_track_info: AtomicRefCell<Option<ClapPtr<clap_host_track_info>>>,
+    /// The most recent track information obtained from the host. Only accessed from the main
+    /// thread and by the contexts, never from the audio thread.
+    track_info: Mutex<Option<TrackInfo>>,
 
     clap_plugin_voice_info: clap_plugin_voice_info,
     host_voice_info: AtomicRefCell<Option<ClapPtr<clap_host_voice_info>>>,
@@ -665,6 +679,12 @@ impl<P: ClapPlugin> Wrapper<P> {
                 get: Some(Self::ext_tail_get),
             },
 
+            clap_plugin_track_info: clap_plugin_track_info {
+                changed: Some(Self::ext_track_info_changed),
+            },
+            host_track_info: AtomicRefCell::new(None),
+            track_info: Mutex::new(None),
+
             clap_plugin_voice_info: clap_plugin_voice_info {
                 get: Some(Self::ext_voice_info_get),
             },
@@ -729,10 +749,71 @@ impl<P: ClapPlugin> Wrapper<P> {
 
     fn make_gui_context(self: Arc<Self>) -> Arc<WrapperGuiContext<P>> {
         Arc::new(WrapperGuiContext {
-            wrapper: self,
+            wrapper: WrapperRef::Strong(self),
             #[cfg(debug_assertions)]
             param_gesture_checker: Default::default(),
         })
+    }
+
+    /// The same as [`make_gui_context()`][Self::make_gui_context()], but for
+    /// [`InitContext::instance_gui_context()`][crate::prelude::InitContext::instance_gui_context()].
+    /// This only holds a weak reference to the wrapper since the plugin may store this context,
+    /// and the plugin is owned by the wrapper.
+    pub(crate) fn make_instance_gui_context(&self) -> Arc<WrapperGuiContext<P>> {
+        Arc::new(WrapperGuiContext {
+            wrapper: WrapperRef::Weak(self.this.borrow().clone()),
+            #[cfg(debug_assertions)]
+            param_gesture_checker: Default::default(),
+        })
+    }
+
+    /// The most recent track information obtained from the host, if any.
+    pub fn track_info(&self) -> Option<TrackInfo> {
+        self.track_info.lock().clone()
+    }
+
+    /// Ask the host for the current track information, store it, and tell the plugin about it if
+    /// it changed. Does nothing if the host does not support the track info extension or has no
+    /// information to give. Must be called from the main thread.
+    fn update_track_info(&self) {
+        let info = match &*self.host_track_info.borrow() {
+            Some(host_track_info) => {
+                let mut clap_info = clap_track_info {
+                    flags: 0,
+                    name: [0; CLAP_NAME_SIZE],
+                    color: clap_color {
+                        alpha: 0,
+                        red: 0,
+                        green: 0,
+                        blue: 0,
+                    },
+                    audio_channel_count: 0,
+                    audio_port_type: std::ptr::null(),
+                };
+                // SAFETY: The host extension pointer stays valid for the lifetime of the plugin, and
+                //         `clap_info` is a fully initialized struct the host may write to
+                let success = unsafe_clap_call! {
+                    host_track_info=>get(&*self.host_callback, &mut clap_info)
+                };
+                if !success {
+                    return;
+                }
+
+                track_info_from_clap(&clap_info)
+            }
+            None => return,
+        };
+
+        {
+            let mut track_info = self.track_info.lock();
+            if track_info.as_ref() == Some(&info) {
+                return;
+            }
+
+            *track_info = Some(info.clone());
+        }
+
+        self.plugin.lock().track_info_changed(&info);
     }
 
     /// # Note
@@ -1873,6 +1954,21 @@ impl<P: ClapPlugin> Wrapper<P> {
             &wrapper.host_callback,
             CLAP_EXT_THREAD_CHECK,
         );
+        // Hosts that implemented track info before it was finalized still use the draft ID
+        *wrapper.host_track_info.borrow_mut() = query_host_extension::<clap_host_track_info>(
+            &wrapper.host_callback,
+            CLAP_EXT_TRACK_INFO,
+        )
+        .or_else(|| {
+            query_host_extension::<clap_host_track_info>(
+                &wrapper.host_callback,
+                CLAP_EXT_TRACK_INFO_COMPAT,
+            )
+        });
+
+        // The host only calls `changed()` when the information changes, so the plugin would not
+        // know the initial track name without asking for it here
+        wrapper.update_track_info();
 
         true
     }
@@ -1966,6 +2062,9 @@ impl<P: ClapPlugin> Wrapper<P> {
         process_wrapper(|| wrapper.plugin.lock().reset());
     }
 
+    // The `data32` casts are no-ops with the pinned clap-sys, but they keep the code compiling if
+    // clap-sys changes the pointers' constness again
+    #[allow(clippy::unnecessary_cast)]
     unsafe extern "C" fn process(
         plugin: *const clap_plugin,
         process: *const clap_process,
@@ -2353,6 +2452,8 @@ impl<P: ClapPlugin> Wrapper<P> {
             &wrapper.clap_plugin_state as *const _ as *const c_void
         } else if id == CLAP_EXT_TAIL {
             &wrapper.clap_plugin_tail as *const _ as *const c_void
+        } else if id == CLAP_EXT_TRACK_INFO || id == CLAP_EXT_TRACK_INFO_COMPAT {
+            &wrapper.clap_plugin_track_info as *const _ as *const c_void
         } else if id == CLAP_EXT_VOICE_INFO && P::CLAP_POLY_MODULATION_CONFIG.is_some() {
             &wrapper.clap_plugin_voice_info as *const _ as *const c_void
         } else {
@@ -2771,7 +2872,11 @@ impl<P: ClapPlugin> Wrapper<P> {
         let wrapper = &*((*plugin).plugin_data as *const Self);
 
         let scaling_factor = wrapper.editor_scaling_factor.load(Ordering::Relaxed);
-        let sf = if scaling_factor > 0.0 { scaling_factor } else { 1.0 };
+        let sf = if scaling_factor > 0.0 {
+            scaling_factor
+        } else {
+            1.0
+        };
         let unscaled_w = (width as f32 / sf).round() as u32;
         let unscaled_h = (height as f32 / sf).round() as u32;
 
@@ -3202,7 +3307,10 @@ impl<P: ClapPlugin> Wrapper<P> {
         // Exactly `length` bytes, not the whole spare capacity: an allocator is free to hand out
         // more than was asked for, and reading that many bytes runs off the end of the state and
         // fails the load.
-        if !read_stream(&*stream, &mut read_buffer.spare_capacity_mut()[..length as usize]) {
+        if !read_stream(
+            &*stream,
+            &mut read_buffer.spare_capacity_mut()[..length as usize],
+        ) {
             nih_debug_assert_failure!(
                 "Error or end of stream while reading the state buffer from the stream."
             );
@@ -3233,9 +3341,9 @@ impl<P: ClapPlugin> Wrapper<P> {
                                 )
                             };
                         }
-                        None => nih_debug_assert_failure!(
-                            "The host does not support parameters? What?"
-                        ),
+                        None => {
+                            nih_debug_assert_failure!("The host does not support parameters? What?")
+                        }
                     }
                 }
 
@@ -3254,6 +3362,13 @@ impl<P: ClapPlugin> Wrapper<P> {
             ProcessStatus::KeepAlive => u32::MAX,
             _ => 0,
         }
+    }
+
+    unsafe extern "C" fn ext_track_info_changed(plugin: *const clap_plugin) {
+        check_null_ptr!((), plugin, (*plugin).plugin_data);
+        let wrapper = &*((*plugin).plugin_data as *const Self);
+
+        wrapper.update_track_info();
     }
 
     unsafe extern "C" fn ext_voice_info_get(

@@ -4,7 +4,7 @@ use crossbeam::channel::{self, SendTimeoutError};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use vst3_sys::base::{kInvalidArgument, kResultOk, tresult};
 use vst3_sys::vst::{IComponentHandler, RestartFlags};
@@ -17,17 +17,22 @@ use super::view::WrapperView;
 use crate::event_loop::{EventLoop, MainThreadExecutor, OsEventLoop};
 use crate::prelude::{
     AsyncExecutor, AudioIOLayout, BufferConfig, Editor, MidiConfig, ParamFlags, ParamPtr, Params,
-    Plugin, PluginNoteEvent, ProcessMode, ProcessStatus, TaskExecutor, Transport, Vst3Plugin,
+    Plugin, PluginNoteEvent, ProcessMode, ProcessStatus, TaskExecutor, TrackInfo, Transport,
+    Vst3Plugin,
 };
 use crate::util::permit_alloc;
 use crate::wrapper::state::{self, PluginState};
 use crate::wrapper::util::buffer_management::BufferManager;
-use crate::wrapper::util::{hash_param_id, process_wrapper};
+use crate::wrapper::util::{hash_param_id, process_wrapper, WrapperRef};
 
 /// The actual wrapper bits. We need this as an `Arc<T>` so we can safely use our event loop API.
 /// Since we can't combine that with VST3's interior reference counting this just has to be moved to
 /// its own struct.
 pub(crate) struct WrapperInner<P: Vst3Plugin> {
+    /// A weak reference to this object, used for the context returned from
+    /// [`InitContext::instance_gui_context()`][crate::prelude::InitContext::instance_gui_context()].
+    this: Weak<Self>,
+
     /// The wrapped plugin instance.
     pub plugin: Mutex<P>,
     /// The plugin's background task executor closure.
@@ -78,6 +83,10 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     /// The current latency in samples, as set by the plugin through the [`InitContext`] and the
     /// [`ProcessContext`].
     pub current_latency: AtomicU32,
+    /// The most recent track information the host sent through
+    /// `IInfoListener::setChannelContextInfos()`. Only accessed from the main thread and by the
+    /// contexts, never from the audio thread.
+    pub track_info: Mutex<Option<TrackInfo>>,
     /// A data structure that helps manage and create buffers for all of the plugin's inputs and
     /// outputs based on channel pointers provided by the host.
     pub buffer_manager: AtomicRefCell<BufferManager>,
@@ -274,7 +283,9 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             .map(|(_, hash, ptr, _)| (ptr, hash))
             .collect();
 
-        let wrapper = Arc::new(Self {
+        let wrapper = Arc::new_cyclic(|this| Self {
+            this: this.clone(),
+
             plugin: Mutex::new(plugin),
             task_executor,
             params,
@@ -299,6 +310,7 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             current_process_mode: AtomicCell::new(ProcessMode::Realtime),
             last_process_status: AtomicCell::new(ProcessStatus::Normal),
             current_latency: AtomicU32::new(0),
+            track_info: Mutex::new(None),
             // This is initialized just before calling `Plugin::initialize()` so that during the
             // process call buffers can be initialized without any allocations
             buffer_manager: AtomicRefCell::new(BufferManager::for_audio_io_layout(
@@ -355,10 +367,37 @@ impl<P: Vst3Plugin> WrapperInner<P> {
 
     pub fn make_gui_context(self: Arc<Self>) -> Arc<WrapperGuiContext<P>> {
         Arc::new(WrapperGuiContext {
-            inner: self,
+            inner: WrapperRef::Strong(self),
             #[cfg(debug_assertions)]
             param_gesture_checker: Default::default(),
         })
+    }
+
+    /// The same as [`make_gui_context()`][Self::make_gui_context()], but for
+    /// [`InitContext::instance_gui_context()`][crate::prelude::InitContext::instance_gui_context()].
+    /// This only holds a weak reference to the wrapper since the plugin may store this context,
+    /// and the plugin is owned by the wrapper.
+    pub fn make_instance_gui_context(&self) -> Arc<WrapperGuiContext<P>> {
+        Arc::new(WrapperGuiContext {
+            inner: WrapperRef::Weak(self.this.clone()),
+            #[cfg(debug_assertions)]
+            param_gesture_checker: Default::default(),
+        })
+    }
+
+    /// Store new track information sent by the host and tell the plugin about it if it changed.
+    /// Called from the main thread.
+    pub fn set_track_info(&self, info: TrackInfo) {
+        {
+            let mut track_info = self.track_info.lock();
+            if track_info.as_ref() == Some(&info) {
+                return;
+            }
+
+            *track_info = Some(info.clone());
+        }
+
+        self.plugin.lock().track_info_changed(&info);
     }
 
     /// # Note
@@ -649,5 +688,203 @@ impl<P: Vst3Plugin> MainThreadExecutor<Task<P>> for WrapperInner<P> {
                 None => nih_debug_assert_failure!("Can't resize a closed editor"),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vst3_sys::base::{kResultOk, tresult};
+    use vst3_sys::interfaces::IUnknown;
+    use vst3_sys::VST3;
+
+    use super::*;
+    use crate::prelude::{
+        AuxiliaryBuffers, Buffer, FloatParam, FloatRange, GuiContext, InitContext, Param,
+        ParamSetter, ProcessContext, Vst3SubCategory,
+    };
+
+    // Alias needed for the VST3 attribute macro
+    use vst3_sys as vst3_com;
+
+    struct TestParams {
+        gain: FloatParam,
+    }
+
+    // SAFETY: The only parameter pointer points to a field of this struct, which lives as long as
+    //         the `Arc<TestParams>` the wrapper keeps
+    unsafe impl Params for TestParams {
+        fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
+            vec![(String::from("gain"), self.gain.as_ptr(), String::new())]
+        }
+    }
+
+    struct TestPlugin {
+        params: Arc<TestParams>,
+        /// Every value passed to `track_info_changed()`, in order.
+        track_info_changes: Mutex<Vec<TrackInfo>>,
+    }
+
+    impl Default for TestPlugin {
+        fn default() -> Self {
+            Self {
+                params: Arc::new(TestParams {
+                    gain: FloatParam::new("Gain", 0.0, FloatRange::Linear { min: 0.0, max: 1.0 }),
+                }),
+                track_info_changes: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Plugin for TestPlugin {
+        const NAME: &'static str = "Test Plugin";
+        const VENDOR: &'static str = "Test";
+        const URL: &'static str = "";
+        const EMAIL: &'static str = "";
+        const VERSION: &'static str = "0.0.0";
+        const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[];
+
+        type SysExMessage = ();
+        type BackgroundTask = ();
+
+        fn params(&self) -> Arc<dyn Params> {
+            self.params.clone()
+        }
+
+        fn process(
+            &mut self,
+            _buffer: &mut Buffer,
+            _aux: &mut AuxiliaryBuffers,
+            _context: &mut impl ProcessContext<Self>,
+        ) -> ProcessStatus {
+            ProcessStatus::Normal
+        }
+
+        fn track_info_changed(&self, info: &TrackInfo) {
+            self.track_info_changes.lock().push(info.clone());
+        }
+    }
+
+    impl Vst3Plugin for TestPlugin {
+        const VST3_CLASS_ID: [u8; 16] = *b"NihPlugTestInner";
+        const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[Vst3SubCategory::Fx];
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum HostEdit {
+        Begin(u32),
+        Perform(u32, f64),
+        End(u32),
+    }
+
+    /// A host side component handler that records every edit it receives.
+    #[VST3(implements(IComponentHandler))]
+    struct TestComponentHandler {
+        edits: Mutex<Vec<HostEdit>>,
+    }
+
+    impl IComponentHandler for TestComponentHandler {
+        unsafe fn begin_edit(&self, id: u32) -> tresult {
+            self.edits.lock().push(HostEdit::Begin(id));
+            kResultOk
+        }
+
+        unsafe fn perform_edit(&self, id: u32, value_normalized: f64) -> tresult {
+            self.edits
+                .lock()
+                .push(HostEdit::Perform(id, value_normalized));
+            kResultOk
+        }
+
+        unsafe fn end_edit(&self, id: u32) -> tresult {
+            self.edits.lock().push(HostEdit::End(id));
+            kResultOk
+        }
+
+        unsafe fn restart_component(&self, _flags: i32) -> tresult {
+            kResultOk
+        }
+    }
+
+    #[test]
+    fn instance_gui_context_sets_parameters() {
+        let inner = WrapperInner::<TestPlugin>::new();
+        let handler = Box::into_raw(TestComponentHandler::allocate(Mutex::new(Vec::new())));
+        // SAFETY: `handler` points to a live COM object implementing `IComponentHandler` as its
+        //         first interface. `shared()` takes its own reference, which the wrapper releases
+        //         when it is dropped.
+        *inner.component_handler.borrow_mut() = unsafe {
+            vst3_sys::VstPtr::<dyn IComponentHandler>::shared(handler as *mut _).map(VstPtr::from)
+        };
+
+        // The plugin would do this in `initialize()` and keep the context for later
+        let context: Arc<dyn GuiContext> = inner
+            .make_init_context()
+            .instance_gui_context()
+            .expect("The VST3 wrapper always provides an instance context");
+        let params = inner.plugin.lock().params.clone();
+        let hash = hash_param_id("gain");
+
+        let setter = ParamSetter::new(context.as_ref());
+        setter.begin_set_parameter(&params.gain);
+        setter.set_parameter(&params.gain, 0.25);
+        setter.end_set_parameter(&params.gain);
+
+        assert_eq!(params.gain.value(), 0.25);
+        // SAFETY: The wrapper still holds a reference to the handler
+        let edits = unsafe { (*handler).edits.lock().clone() };
+        assert_eq!(
+            edits,
+            vec![
+                HostEdit::Begin(hash),
+                HostEdit::Perform(hash, 0.25),
+                HostEdit::End(hash)
+            ]
+        );
+
+        // The context must not keep the instance alive, and it does nothing once it is gone
+        let weak_inner = Arc::downgrade(&inner);
+        drop(inner);
+        assert!(weak_inner.upgrade().is_none());
+
+        setter.begin_set_parameter(&params.gain);
+        setter.set_parameter(&params.gain, 0.75);
+        setter.end_set_parameter(&params.gain);
+        assert_eq!(params.gain.value(), 0.25);
+        assert!(context.get_state().params.is_empty());
+
+        // SAFETY: The wrapper released its reference when it was dropped, so this releases the
+        //         last one and frees the handler. It is not used afterwards.
+        let edits = unsafe {
+            let edits = (*handler).edits.lock().clone();
+            (*handler).release();
+            edits
+        };
+        assert_eq!(edits.len(), 3);
+    }
+
+    #[test]
+    fn track_info_reaches_plugin_and_contexts() {
+        let inner = WrapperInner::<TestPlugin>::new();
+        assert_eq!(inner.make_init_context().track_info(), None);
+        assert_eq!(inner.clone().make_gui_context().track_info(), None);
+
+        let info = TrackInfo {
+            name: Some(String::from("Kick")),
+            color: Some(0xFF11_2233),
+        };
+        inner.set_track_info(info.clone());
+        // Hosts may send the same information again, the plugin is only told about changes
+        inner.set_track_info(info.clone());
+
+        assert_eq!(inner.make_init_context().track_info(), Some(info.clone()));
+        assert_eq!(
+            inner.clone().make_gui_context().track_info(),
+            Some(info.clone())
+        );
+        assert_eq!(
+            inner.make_instance_gui_context().track_info(),
+            Some(info.clone())
+        );
+        assert_eq!(*inner.plugin.lock().track_info_changes.lock(), vec![info]);
     }
 }

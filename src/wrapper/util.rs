@@ -1,7 +1,9 @@
 use backtrace::Backtrace;
 use std::cmp;
 use std::marker::PhantomData;
+use std::ops::Deref;
 use std::os::raw::c_char;
+use std::sync::{Arc, Weak};
 
 use crate::util::permit_alloc;
 
@@ -75,6 +77,59 @@ pub fn strlcpy(dest: &mut [c_char], src: &str) {
     let copy_len = cmp::min(dest.len() - 1, src.len());
     dest[..copy_len].copy_from_slice(&src_bytes_signed[..copy_len]);
     dest[copy_len] = 0;
+}
+
+/// Read a string from a fixed size C character buffer filled in by the host. The host's data is
+/// not trusted: reading stops at the first null character or at the end of the buffer, whichever
+/// comes first, so a missing terminator cannot cause an out of bounds read. Invalid UTF-8 is
+/// replaced with U+FFFD instead of being rejected.
+pub fn string_from_c_chars(src: &[c_char]) -> String {
+    // NOTE: `c_char` is i8 on x86 based archs, and u8 on AArch64. There this cast does nothing.
+    let bytes: Vec<u8> = src
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// How a [`GuiContext`][crate::prelude::GuiContext] implementation refers to its wrapper. The
+/// context passed to an editor owns a strong reference, like it always has. The context returned
+/// from [`InitContext::instance_gui_context()`][crate::prelude::InitContext::instance_gui_context()]
+/// holds a weak reference instead. The plugin stores that context inside the wrapper, so a strong
+/// reference would form a cycle and the instance would never be freed.
+pub(crate) enum WrapperRef<T> {
+    Strong(Arc<T>),
+    Weak(Weak<T>),
+}
+
+/// A temporary handle to the wrapper obtained through [`WrapperRef::get()`].
+pub(crate) enum WrapperRefGuard<'a, T> {
+    Borrowed(&'a T),
+    Upgraded(Arc<T>),
+}
+
+impl<T> WrapperRef<T> {
+    /// Get the wrapper, or `None` if this is a weak reference and the wrapper has already been
+    /// dropped.
+    pub fn get(&self) -> Option<WrapperRefGuard<'_, T>> {
+        match self {
+            WrapperRef::Strong(wrapper) => Some(WrapperRefGuard::Borrowed(wrapper)),
+            WrapperRef::Weak(wrapper) => wrapper.upgrade().map(WrapperRefGuard::Upgraded),
+        }
+    }
+}
+
+impl<T> Deref for WrapperRefGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        match self {
+            WrapperRefGuard::Borrowed(wrapper) => wrapper,
+            WrapperRefGuard::Upgraded(wrapper) => wrapper,
+        }
+    }
 }
 
 /// Clamp an input event's timing to the buffer length. Emits a debug assertion failure if it was

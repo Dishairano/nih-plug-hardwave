@@ -383,7 +383,11 @@ impl<P: Vst3Plugin> IPlugView for WrapperView<P> {
         }
 
         let scaling_factor = self.scaling_factor.load(Ordering::Relaxed);
-        let sf = if scaling_factor > 0.0 { scaling_factor } else { 1.0 };
+        let sf = if scaling_factor > 0.0 {
+            scaling_factor
+        } else {
+            1.0
+        };
         let unscaled_w = (width as f32 / sf).round() as u32;
         let unscaled_h = (height as f32 / sf).round() as u32;
 

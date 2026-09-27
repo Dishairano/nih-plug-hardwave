@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::prelude::{
     AsyncExecutor, AudioIOLayout, AuxiliaryBuffers, Buffer, BufferConfig, Editor, InitContext,
-    MidiConfig, Params, PluginState, ProcessContext, SysExMessage,
+    MidiConfig, Params, PluginState, ProcessContext, SysExMessage, TrackInfo,
 };
 
 pub mod clap;
@@ -252,6 +252,14 @@ pub trait Plugin: Default + Send + 'static {
     /// `initialize()` may be called more than once before `deactivate()` is called, for instance
     /// when restoring state while the plugin is still activate.
     fn deactivate(&mut self) {}
+
+    /// Called on the main thread when the host sends new information about the track this instance
+    /// sits on, such as the track's name or color. The same information is available afterwards
+    /// through [`InitContext::track_info()`] and
+    /// [`GuiContext::track_info()`][crate::prelude::GuiContext::track_info()]. Hosts that do not
+    /// support this never call it. This must not block for long, as the audio thread may be
+    /// waiting on the plugin's lock while this runs.
+    fn track_info_changed(&self, info: &TrackInfo) {}
 }
 
 /// Indicates the current situation after the plugin has processed audio.
