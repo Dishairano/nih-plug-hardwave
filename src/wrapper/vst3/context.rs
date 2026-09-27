@@ -161,7 +161,7 @@ impl<P: Vst3Plugin> GuiContext for WrapperGuiContext<P> {
                 None => nih_debug_assert_failure!("Unknown parameter: {:?}", param),
             },
             None => nih_debug_assert_failure!("Component handler not yet set"),
-        }
+        };
 
         #[cfg(debug_assertions)]
         match inner.param_id_from_ptr(param) {
@@ -203,7 +203,7 @@ impl<P: Vst3Plugin> GuiContext for WrapperGuiContext<P> {
                 None => nih_debug_assert_failure!("Unknown parameter: {:?}", param),
             },
             None => nih_debug_assert_failure!("Component handler not yet set"),
-        }
+        };
 
         #[cfg(debug_assertions)]
         match inner.param_id_from_ptr(param) {
@@ -230,7 +230,7 @@ impl<P: Vst3Plugin> GuiContext for WrapperGuiContext<P> {
                 None => nih_debug_assert_failure!("Unknown parameter: {:?}", param),
             },
             None => nih_debug_assert_failure!("Component handler not yet set"),
-        }
+        };
 
         #[cfg(debug_assertions)]
         match inner.param_id_from_ptr(param) {
