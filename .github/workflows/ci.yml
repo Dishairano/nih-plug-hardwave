@@ -1,0 +1,62 @@
+name: CI
+
+# Every Hardwave plug-in depends on this fork's main branch and ships release builds for
+# Windows and macOS. Job 1727 passed every debug check on Linux and still broke the release
+# build of every plug-in, because code under #[cfg(debug_assertions)] is gone in release.
+# So the framework is checked in both profiles on all three systems.
+on:
+  pull_request:
+  push:
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    name: Compiles on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libjack-jackd2-dev libx11-dev libxcb1-dev \
+            libxcb-icccm4-dev libxcursor-dev libxkbcommon-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libgl1-mesa-dev
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Upstream code for Windows and macOS carries a few old lints (objc macros, a CString
+      # literal, a same-type cast), so clippy -D warnings runs on Linux and the other two
+      # systems must compile in both profiles.
+      - name: Clippy (debug)
+        if: runner.os == 'Linux'
+        run: cargo clippy -p nih_plug --features vst3 -- -D warnings
+      - name: Clippy (release)
+        if: runner.os == 'Linux'
+        run: cargo clippy -p nih_plug --features vst3 --release -- -D warnings
+      - name: Check (debug)
+        if: runner.os != 'Linux'
+        run: cargo check -p nih_plug --features vst3
+      - name: Check (release)
+        if: runner.os != 'Linux'
+        run: cargo check -p nih_plug --features vst3 --release
+      - name: Tests
+        run: cargo test -p nih_plug --features vst3 --lib
