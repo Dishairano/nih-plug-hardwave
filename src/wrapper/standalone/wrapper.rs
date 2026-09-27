@@ -7,7 +7,7 @@ use raw_window_handle::HasRawWindowHandle;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::thread;
 
 use super::backend::Backend;
@@ -21,13 +21,17 @@ use crate::prelude::{
 };
 use crate::util::permit_alloc;
 use crate::wrapper::state::{self, PluginState};
-use crate::wrapper::util::process_wrapper;
+use crate::wrapper::util::{process_wrapper, WrapperRef};
 
 /// How many parameter changes we can store in our unprocessed parameter change queue. Storing more
 /// than this many parameters at a time will cause changes to get lost.
 const EVENT_QUEUE_CAPACITY: usize = 2048;
 
 pub struct Wrapper<P: Plugin, B: Backend<P>> {
+    /// A weak reference to this object, used for the context returned from
+    /// [`InitContext::instance_gui_context()`][crate::prelude::InitContext::instance_gui_context()].
+    this: Weak<Self>,
+
     backend: AtomicRefCell<B>,
 
     /// The wrapped plugin instance.
@@ -216,7 +220,9 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
             }
         }
 
-        let wrapper = Arc::new(Wrapper {
+        let wrapper = Arc::new_cyclic(|this| Wrapper {
+            this: this.clone(),
+
             backend: AtomicRefCell::new(backend),
 
             plugin: Mutex::new(plugin),
@@ -585,7 +591,19 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
 
     fn make_gui_context(self: Arc<Self>) -> Arc<WrapperGuiContext<P, B>> {
         Arc::new(WrapperGuiContext {
-            wrapper: self,
+            wrapper: WrapperRef::Strong(self),
+            #[cfg(debug_assertions)]
+            param_gesture_checker: Default::default(),
+        })
+    }
+
+    /// The same as [`make_gui_context()`][Self::make_gui_context()], but for
+    /// [`InitContext::instance_gui_context()`][crate::prelude::InitContext::instance_gui_context()].
+    /// This only holds a weak reference to the wrapper since the plugin may store this context,
+    /// and the plugin is owned by the wrapper.
+    pub(super) fn make_instance_gui_context(&self) -> Arc<WrapperGuiContext<P, B>> {
+        Arc::new(WrapperGuiContext {
+            wrapper: WrapperRef::Weak(self.this.clone()),
             #[cfg(debug_assertions)]
             param_gesture_checker: Default::default(),
         })

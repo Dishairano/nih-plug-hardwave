@@ -6,6 +6,7 @@ use crate::prelude::{
     GuiContext, InitContext, ParamPtr, Plugin, PluginApi, PluginNoteEvent, ProcessContext,
     Transport,
 };
+use crate::wrapper::util::WrapperRef;
 
 /// An [`InitContext`] implementation for the standalone wrapper.
 pub(crate) struct WrapperInitContext<'a, P: Plugin, B: Backend<P>> {
@@ -28,9 +29,10 @@ pub(crate) struct WrapperProcessContext<'a, P: Plugin, B: Backend<P>> {
 
 /// A [`GuiContext`] implementation for the wrapper. This is passed to the plugin in
 /// [`Editor::spawn()`][crate::prelude::Editor::spawn()] so it can interact with the rest of the plugin and
-/// with the host for things like setting parameters.
+/// with the host for things like setting parameters. The same type is returned from
+/// [`InitContext::instance_gui_context()`], in which case it holds a weak reference to the wrapper.
 pub(crate) struct WrapperGuiContext<P: Plugin, B: Backend<P>> {
-    pub(super) wrapper: Arc<Wrapper<P, B>>,
+    pub(super) wrapper: WrapperRef<Wrapper<P, B>>,
     #[cfg(debug_assertions)]
     pub(super) param_gesture_checker:
         atomic_refcell::AtomicRefCell<crate::wrapper::util::context_checks::ParamGestureChecker>,
@@ -51,6 +53,10 @@ impl<P: Plugin, B: Backend<P>> InitContext<P> for WrapperInitContext<'_, P, B> {
 
     fn set_current_voice_capacity(&self, _capacity: u32) {
         // This is only supported by CLAP
+    }
+
+    fn instance_gui_context(&self) -> Option<Arc<dyn GuiContext>> {
+        Some(self.wrapper.make_instance_gui_context())
     }
 }
 
@@ -105,7 +111,11 @@ impl<P: Plugin, B: Backend<P>> GuiContext for WrapperGuiContext<P, B> {
     }
 
     fn request_resize(&self) -> bool {
-        self.wrapper.request_resize();
+        let Some(wrapper) = self.wrapper.get() else {
+            return false;
+        };
+
+        wrapper.request_resize();
         true
     }
 
@@ -113,7 +123,12 @@ impl<P: Plugin, B: Backend<P>> GuiContext for WrapperGuiContext<P, B> {
         // Since there's no automation being recorded here, gestures don't mean anything
 
         #[cfg(debug_assertions)]
-        match self.wrapper.param_id_from_ptr(_param) {
+        let Some(wrapper) = self.wrapper.get() else {
+            return;
+        };
+
+        #[cfg(debug_assertions)]
+        match wrapper.param_id_from_ptr(_param) {
             Some(param_id) => self
                 .param_gesture_checker
                 .borrow_mut()
@@ -125,10 +140,14 @@ impl<P: Plugin, B: Backend<P>> GuiContext for WrapperGuiContext<P, B> {
     }
 
     unsafe fn raw_set_parameter_normalized(&self, param: ParamPtr, normalized: f32) {
-        self.wrapper.set_parameter(param, normalized);
+        let Some(wrapper) = self.wrapper.get() else {
+            return;
+        };
+
+        wrapper.set_parameter(param, normalized);
 
         #[cfg(debug_assertions)]
-        match self.wrapper.param_id_from_ptr(param) {
+        match wrapper.param_id_from_ptr(param) {
             Some(param_id) => self
                 .param_gesture_checker
                 .borrow_mut()
@@ -141,7 +160,12 @@ impl<P: Plugin, B: Backend<P>> GuiContext for WrapperGuiContext<P, B> {
 
     unsafe fn raw_end_set_parameter(&self, _param: ParamPtr) {
         #[cfg(debug_assertions)]
-        match self.wrapper.param_id_from_ptr(_param) {
+        let Some(wrapper) = self.wrapper.get() else {
+            return;
+        };
+
+        #[cfg(debug_assertions)]
+        match wrapper.param_id_from_ptr(_param) {
             Some(param_id) => self
                 .param_gesture_checker
                 .borrow_mut()
@@ -153,10 +177,17 @@ impl<P: Plugin, B: Backend<P>> GuiContext for WrapperGuiContext<P, B> {
     }
 
     fn get_state(&self) -> crate::wrapper::state::PluginState {
-        self.wrapper.get_state_object()
+        match self.wrapper.get() {
+            Some(wrapper) => wrapper.get_state_object(),
+            None => crate::wrapper::state::PluginState::empty(),
+        }
     }
 
     fn set_state(&self, state: crate::wrapper::state::PluginState) {
-        self.wrapper.set_state_object_from_gui(state)
+        let Some(wrapper) = self.wrapper.get() else {
+            return;
+        };
+
+        wrapper.set_state_object_from_gui(state)
     }
 }

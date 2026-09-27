@@ -1,7 +1,14 @@
+use clap_sys::color::clap_color;
+use clap_sys::ext::track_info::{
+    clap_track_info, CLAP_TRACK_INFO_HAS_TRACK_COLOR, CLAP_TRACK_INFO_HAS_TRACK_NAME,
+};
 use clap_sys::stream::{clap_istream, clap_ostream};
 use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::os::raw::c_void;
+
+use crate::prelude::TrackInfo;
+use crate::wrapper::util::string_from_c_chars;
 
 /// Early exit out of a function with the specified return value when one of the passed pointers is
 /// null.
@@ -56,6 +63,8 @@ pub fn type_name_of_ptr<T: ?Sized>(_ptr: *const T) -> &'static str {
 
 pub(crate) use check_null_ptr_msg;
 pub(crate) use clap_call;
+// The wrapper reaches this macro through `#[macro_use]`, so the path import is not used right now
+#[allow(unused_imports)]
 pub(crate) use unsafe_clap_call;
 
 /// Send+Sync wrapper around CLAP host extension pointers.
@@ -143,6 +152,33 @@ pub fn read_stream(stream: &clap_istream, mut slice: impl ByteReadBuffer) -> boo
     true
 }
 
+/// Convert the track information a host wrote through `clap_host_track_info::get()`. Only the
+/// fields the host marked as present through the flags are used. The name is read up to its first
+/// null character or the end of the fixed size array, so a host that does not terminate it cannot
+/// cause an out of bounds read. An empty name counts as no name.
+pub fn track_info_from_clap(info: &clap_track_info) -> TrackInfo {
+    let name = if info.flags & CLAP_TRACK_INFO_HAS_TRACK_NAME != 0 {
+        Some(string_from_c_chars(&info.name)).filter(|name| !name.is_empty())
+    } else {
+        None
+    };
+
+    let color = if info.flags & CLAP_TRACK_INFO_HAS_TRACK_COLOR != 0 {
+        let clap_color {
+            alpha,
+            red,
+            green,
+            blue,
+        } = info.color;
+
+        Some(u32::from_be_bytes([alpha, red, green, blue]))
+    } else {
+        None
+    };
+
+    TrackInfo { name, color }
+}
+
 /// Write the data from a slice to a stream until either all data has been written, or the stream
 /// returns an error. This correctly handles streams that only allow smaller, buffered writes. This
 /// returns `false` if the stream returns an error or doesn't allow any writes anymore.
@@ -164,4 +200,94 @@ pub fn write_stream(stream: &clap_ostream, slice: &[u8]) -> bool {
     }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use clap_sys::ext::track_info::CLAP_TRACK_INFO_HAS_AUDIO_CHANNEL;
+    use clap_sys::string_sizes::CLAP_NAME_SIZE;
+    use std::os::raw::c_char;
+
+    use super::*;
+    use crate::wrapper::util::strlcpy;
+
+    fn empty_info() -> clap_track_info {
+        clap_track_info {
+            flags: 0,
+            name: [0; CLAP_NAME_SIZE],
+            color: clap_color {
+                alpha: 0,
+                red: 0,
+                green: 0,
+                blue: 0,
+            },
+            audio_channel_count: 0,
+            audio_port_type: std::ptr::null(),
+        }
+    }
+
+    #[test]
+    fn track_info_name_and_color() {
+        let mut info = empty_info();
+        info.flags = CLAP_TRACK_INFO_HAS_TRACK_NAME | CLAP_TRACK_INFO_HAS_TRACK_COLOR;
+        strlcpy(&mut info.name, "Kick Bus");
+        info.color = clap_color {
+            alpha: 0xFF,
+            red: 0x20,
+            green: 0x40,
+            blue: 0x80,
+        };
+
+        assert_eq!(
+            track_info_from_clap(&info),
+            TrackInfo {
+                name: Some(String::from("Kick Bus")),
+                color: Some(0xFF20_4080),
+            }
+        );
+    }
+
+    #[test]
+    fn track_info_ignores_fields_without_flags() {
+        let mut info = empty_info();
+        info.flags = CLAP_TRACK_INFO_HAS_AUDIO_CHANNEL;
+        strlcpy(&mut info.name, "Not Flagged");
+        info.color.red = 0xFF;
+
+        assert_eq!(track_info_from_clap(&info), TrackInfo::default());
+    }
+
+    #[test]
+    fn track_info_empty_name_is_none() {
+        let mut info = empty_info();
+        info.flags = CLAP_TRACK_INFO_HAS_TRACK_NAME;
+
+        assert_eq!(track_info_from_clap(&info).name, None);
+    }
+
+    #[test]
+    fn track_info_unterminated_name_is_cut_off() {
+        let mut info = empty_info();
+        info.flags = CLAP_TRACK_INFO_HAS_TRACK_NAME;
+        info.name = [b'a' as c_char; CLAP_NAME_SIZE];
+
+        assert_eq!(
+            track_info_from_clap(&info).name,
+            Some("a".repeat(CLAP_NAME_SIZE))
+        );
+    }
+
+    #[test]
+    fn track_info_invalid_utf8_is_replaced() {
+        let mut info = empty_info();
+        info.flags = CLAP_TRACK_INFO_HAS_TRACK_NAME;
+        info.name[0] = b'A' as c_char;
+        info.name[1] = 0xFFu8 as c_char;
+        info.name[2] = b'B' as c_char;
+
+        assert_eq!(
+            track_info_from_clap(&info).name,
+            Some(String::from("A\u{FFFD}B"))
+        );
+    }
 }

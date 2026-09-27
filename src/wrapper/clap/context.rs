@@ -1,7 +1,5 @@
 use atomic_refcell::AtomicRefMut;
-use clap_sys::ext::remote_controls::{
-    clap_remote_controls_page, CLAP_REMOTE_CONTROLS_COUNT,
-};
+use clap_sys::ext::remote_controls::{clap_remote_controls_page, CLAP_REMOTE_CONTROLS_COUNT};
 use clap_sys::id::{clap_id, CLAP_INVALID_ID};
 use clap_sys::string_sizes::CLAP_NAME_SIZE;
 use std::cell::Cell;
@@ -12,9 +10,9 @@ use super::wrapper::{OutputParamEvent, Task, Wrapper};
 use crate::event_loop::EventLoop;
 use crate::prelude::{
     ClapPlugin, GuiContext, InitContext, ParamPtr, PluginApi, PluginNoteEvent, ProcessContext,
-    RemoteControlsContext, RemoteControlsPage, RemoteControlsSection, Transport,
+    RemoteControlsContext, RemoteControlsPage, RemoteControlsSection, TrackInfo, Transport,
 };
-use crate::wrapper::util::strlcpy;
+use crate::wrapper::util::{strlcpy, WrapperRef};
 
 /// An [`InitContext`] implementation for the wrapper.
 ///
@@ -47,9 +45,10 @@ pub(crate) struct WrapperProcessContext<'a, P: ClapPlugin> {
 
 /// A [`GuiContext`] implementation for the wrapper. This is passed to the plugin in
 /// [`Editor::spawn()`][crate::prelude::Editor::spawn()] so it can interact with the rest of the plugin and
-/// with the host for things like setting parameters.
+/// with the host for things like setting parameters. The same type is returned from
+/// [`InitContext::instance_gui_context()`], in which case it holds a weak reference to the wrapper.
 pub(crate) struct WrapperGuiContext<P: ClapPlugin> {
-    pub(super) wrapper: Arc<Wrapper<P>>,
+    pub(super) wrapper: WrapperRef<Wrapper<P>>,
     #[cfg(debug_assertions)]
     pub(super) param_gesture_checker:
         atomic_refcell::AtomicRefCell<crate::wrapper::util::context_checks::ParamGestureChecker>,
@@ -89,6 +88,14 @@ impl<P: ClapPlugin> InitContext<P> for WrapperInitContext<'_, P> {
 
     fn set_current_voice_capacity(&self, capacity: u32) {
         self.wrapper.set_current_voice_capacity(capacity)
+    }
+
+    fn track_info(&self) -> Option<TrackInfo> {
+        self.wrapper.track_info()
+    }
+
+    fn instance_gui_context(&self) -> Option<Arc<dyn GuiContext>> {
+        Some(self.wrapper.make_instance_gui_context())
     }
 }
 
@@ -135,16 +142,23 @@ impl<P: ClapPlugin> GuiContext for WrapperGuiContext<P> {
     }
 
     fn request_resize(&self) -> bool {
-        self.wrapper.request_resize()
+        let Some(wrapper) = self.wrapper.get() else {
+            return false;
+        };
+
+        wrapper.request_resize()
     }
 
     // All of these functions are supposed to be called from the main thread, so we'll put some
     // trust in the caller and assume that this is indeed the case
     unsafe fn raw_begin_set_parameter(&self, param: ParamPtr) {
-        match self.wrapper.param_ptr_to_hash.get(&param) {
+        let Some(wrapper) = self.wrapper.get() else {
+            return;
+        };
+
+        match wrapper.param_ptr_to_hash.get(&param) {
             Some(hash) => {
-                let success = self
-                    .wrapper
+                let success = wrapper
                     .queue_parameter_event(OutputParamEvent::BeginGesture { param_hash: *hash });
 
                 nih_debug_assert!(
@@ -157,7 +171,7 @@ impl<P: ClapPlugin> GuiContext for WrapperGuiContext<P> {
         }
 
         #[cfg(debug_assertions)]
-        match self.wrapper.param_id_from_ptr(param) {
+        match wrapper.param_id_from_ptr(param) {
             Some(param_id) => self
                 .param_gesture_checker
                 .borrow_mut()
@@ -169,7 +183,11 @@ impl<P: ClapPlugin> GuiContext for WrapperGuiContext<P> {
     }
 
     unsafe fn raw_set_parameter_normalized(&self, param: ParamPtr, normalized: f32) {
-        match self.wrapper.param_ptr_to_hash.get(&param) {
+        let Some(wrapper) = self.wrapper.get() else {
+            return;
+        };
+
+        match wrapper.param_ptr_to_hash.get(&param) {
             Some(hash) => {
                 // We queue the parameter change event here, and it will be sent to the host either
                 // at the end of the current processing cycle or after requesting an explicit flush
@@ -177,12 +195,10 @@ impl<P: ClapPlugin> GuiContext for WrapperGuiContext<P> {
                 // be changed when the output event is written to prevent changing parameter values
                 // in the middle of processing audio.
                 let clap_plain_value = normalized as f64 * param.step_count().unwrap_or(1) as f64;
-                let success = self
-                    .wrapper
-                    .queue_parameter_event(OutputParamEvent::SetValue {
-                        param_hash: *hash,
-                        clap_plain_value,
-                    });
+                let success = wrapper.queue_parameter_event(OutputParamEvent::SetValue {
+                    param_hash: *hash,
+                    clap_plain_value,
+                });
 
                 nih_debug_assert!(
                     success,
@@ -194,7 +210,7 @@ impl<P: ClapPlugin> GuiContext for WrapperGuiContext<P> {
         }
 
         #[cfg(debug_assertions)]
-        match self.wrapper.param_id_from_ptr(param) {
+        match wrapper.param_id_from_ptr(param) {
             Some(param_id) => self
                 .param_gesture_checker
                 .borrow_mut()
@@ -206,10 +222,13 @@ impl<P: ClapPlugin> GuiContext for WrapperGuiContext<P> {
     }
 
     unsafe fn raw_end_set_parameter(&self, param: ParamPtr) {
-        match self.wrapper.param_ptr_to_hash.get(&param) {
+        let Some(wrapper) = self.wrapper.get() else {
+            return;
+        };
+
+        match wrapper.param_ptr_to_hash.get(&param) {
             Some(hash) => {
-                let success = self
-                    .wrapper
+                let success = wrapper
                     .queue_parameter_event(OutputParamEvent::EndGesture { param_hash: *hash });
 
                 nih_debug_assert!(
@@ -222,7 +241,7 @@ impl<P: ClapPlugin> GuiContext for WrapperGuiContext<P> {
         }
 
         #[cfg(debug_assertions)]
-        match self.wrapper.param_id_from_ptr(param) {
+        match wrapper.param_id_from_ptr(param) {
             Some(param_id) => self
                 .param_gesture_checker
                 .borrow_mut()
@@ -234,11 +253,22 @@ impl<P: ClapPlugin> GuiContext for WrapperGuiContext<P> {
     }
 
     fn get_state(&self) -> crate::wrapper::state::PluginState {
-        self.wrapper.get_state_object()
+        match self.wrapper.get() {
+            Some(wrapper) => wrapper.get_state_object(),
+            None => crate::wrapper::state::PluginState::empty(),
+        }
     }
 
     fn set_state(&self, state: crate::wrapper::state::PluginState) {
-        self.wrapper.set_state_object_from_gui(state)
+        let Some(wrapper) = self.wrapper.get() else {
+            return;
+        };
+
+        wrapper.set_state_object_from_gui(state)
+    }
+
+    fn track_info(&self) -> Option<TrackInfo> {
+        self.wrapper.get()?.track_info()
     }
 }
 

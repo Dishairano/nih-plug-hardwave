@@ -52,6 +52,18 @@ pub struct PluginState {
     pub fields: BTreeMap<String, String>,
 }
 
+impl PluginState {
+    /// A state object without any parameters or fields. Returned by a
+    /// [`GuiContext`][crate::prelude::GuiContext] whose plugin instance no longer exists.
+    pub(crate) fn empty() -> Self {
+        Self {
+            version: String::new(),
+            params: BTreeMap::new(),
+            fields: BTreeMap::new(),
+        }
+    }
+}
+
 /// Create a parameters iterator from the hashtables stored in the plugin wrappers. This avoids
 /// having to call `.param_map()` again, which may include expensive user written code.
 pub(crate) fn make_params_iter<'a>(

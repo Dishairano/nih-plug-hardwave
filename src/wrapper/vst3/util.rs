@@ -1,9 +1,13 @@
 use std::cmp;
+use std::mem;
 use std::ops::Deref;
+use vst3_sys::base::{kResultOk, tchar};
 use vst3_sys::interfaces::IUnknown;
-use vst3_sys::vst::TChar;
+use vst3_sys::vst::{kChannelColorKey, kChannelNameKey, IAttributeList, TChar};
 use vst3_sys::ComInterface;
 use widestring::U16CString;
+
+use crate::prelude::TrackInfo;
 
 /// When `Plugin::MIDI_INPUT` is set to `MidiConfig::MidiCCs` or higher then we'll register 130*16
 /// additional parameters to handle MIDI CCs, channel pressure, and pitch bend, in that order.
@@ -57,6 +61,49 @@ pub fn u16strlcpy(dest: &mut [TChar], src: &str) {
     let copy_len = cmp::min(dest.len() - 1, src_utf16_chars_signed.len());
     dest[..copy_len].copy_from_slice(&src_utf16_chars_signed[..copy_len]);
     dest[copy_len] = 0;
+}
+
+/// The size in UTF-16 code units of the buffer a track name sent by the host is read into. Longer
+/// names are cut off.
+const TRACK_NAME_CAPACITY: usize = 1024;
+
+/// Read the track name and color from the attribute list a host passes to
+/// `IInfoListener::setChannelContextInfos()`. The host's data is not trusted: the name is read into
+/// a fixed size buffer that is never read past its end, whether or not the host terminated the
+/// string, and invalid UTF-16 is replaced with U+FFFD. An empty name counts as no name.
+///
+/// # Safety
+///
+/// `list` must be a valid attribute list, which is the case for any list passed by the host.
+pub unsafe fn track_info_from_attribute_list(list: &impl IAttributeList) -> TrackInfo {
+    let mut name_buffer: [tchar; TRACK_NAME_CAPACITY] = [0; TRACK_NAME_CAPACITY];
+    let name = if list.get_string(
+        kChannelNameKey,
+        name_buffer.as_mut_ptr(),
+        mem::size_of_val(&name_buffer) as u32,
+    ) == kResultOk
+    {
+        let name_utf16: Vec<u16> = name_buffer
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u16)
+            .collect();
+
+        Some(String::from_utf16_lossy(&name_utf16)).filter(|name| !name.is_empty())
+    } else {
+        None
+    };
+
+    let mut color: i64 = 0;
+    let color = if list.get_int(kChannelColorKey, &mut color) == kResultOk {
+        // The color is a 32-bit `ColorSpec` packed as 0xAARRGGBB. Some hosts sign extend it when
+        // storing it as a 64-bit integer, so only the lower 32 bits are meaningful.
+        Some(color as u32)
+    } else {
+        None
+    };
+
+    TrackInfo { name, color }
 }
 
 /// Send+Sync wrapper for these interface pointers.
@@ -115,6 +162,169 @@ unsafe impl<T: ComInterface + ?Sized> Sync for VstPtr<T> {}
 
 unsafe impl<T: IUnknown> Send for ObjectPtr<T> {}
 unsafe impl<T: IUnknown> Sync for ObjectPtr<T> {}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::{c_void, CStr};
+    use vst3_sys::base::{kResultFalse, tresult};
+    use vst3_sys::vst::AttrID;
+    use vst3_sys::VST3;
+
+    use super::*;
+
+    // Alias needed for the VST3 attribute macro
+    use vst3_sys as vst3_com;
+
+    /// A host side attribute list that only answers the channel name and color keys.
+    #[VST3(implements(IAttributeList))]
+    struct TestAttributeList {
+        /// The name as raw UTF-16 code units, copied as is without adding a null terminator.
+        name: Option<Vec<u16>>,
+        color: Option<i64>,
+    }
+
+    impl TestAttributeList {
+        fn create(name: Option<Vec<u16>>, color: Option<i64>) -> Box<Self> {
+            Self::allocate(name, color)
+        }
+    }
+
+    unsafe fn key_is(id: AttrID, key: AttrID) -> bool {
+        CStr::from_ptr(id) == CStr::from_ptr(key)
+    }
+
+    impl IAttributeList for TestAttributeList {
+        unsafe fn set_int(&self, _id: AttrID, _value: i64) -> tresult {
+            kResultFalse
+        }
+
+        unsafe fn get_int(&self, id: AttrID, value: *mut i64) -> tresult {
+            match self.color {
+                Some(color) if key_is(id, kChannelColorKey) => {
+                    *value = color;
+                    kResultOk
+                }
+                _ => kResultFalse,
+            }
+        }
+
+        unsafe fn set_float(&self, _id: AttrID, _value: f64) -> tresult {
+            kResultFalse
+        }
+
+        unsafe fn get_float(&self, _id: AttrID, _value: *mut f64) -> tresult {
+            kResultFalse
+        }
+
+        unsafe fn set_string(&self, _id: AttrID, _value: *const tchar, _size: u32) -> tresult {
+            kResultFalse
+        }
+
+        unsafe fn get_string(&self, id: AttrID, value: *mut tchar, size: u32) -> tresult {
+            match &self.name {
+                Some(name) if key_is(id, kChannelNameKey) => {
+                    // Like a careless host, fill the buffer up to the size without terminating it
+                    let capacity = size as usize / mem::size_of::<tchar>();
+                    let copy_len = cmp::min(capacity, name.len());
+                    // SAFETY: The caller provides a buffer of `size` bytes, and at most that many
+                    //         bytes are written here
+                    let dest = std::slice::from_raw_parts_mut(value, copy_len);
+                    for (dest, src) in dest.iter_mut().zip(name) {
+                        *dest = *src as tchar;
+                    }
+
+                    kResultOk
+                }
+                _ => kResultFalse,
+            }
+        }
+
+        unsafe fn set_binary(&self, _id: AttrID, _ptr: *const c_void, _size: u32) -> tresult {
+            kResultFalse
+        }
+
+        unsafe fn get_binary(
+            &self,
+            _id: AttrID,
+            _ptr: *const *mut c_void,
+            _size: *mut u32,
+        ) -> tresult {
+            kResultFalse
+        }
+    }
+
+    /// Parse the list the same way the wrapper does: through a COM pointer to the host's object.
+    fn parse(list: Box<TestAttributeList>) -> TrackInfo {
+        let raw = Box::into_raw(list);
+        // SAFETY: `raw` points to a live COM object implementing `IAttributeList` as its first
+        //         interface, and `shared()` takes its own reference which is released when `ptr`
+        //         is dropped. The last reference is released below.
+        unsafe {
+            let ptr =
+                vst3_sys::VstPtr::<dyn IAttributeList>::shared(raw as *mut _).expect("Null list");
+            let info = track_info_from_attribute_list(&ptr);
+            drop(ptr);
+            (*raw).release();
+
+            info
+        }
+    }
+
+    #[test]
+    fn track_info_name_and_color() {
+        let name: Vec<u16> = "Kick Bus".encode_utf16().chain([0]).collect();
+        let info = parse(TestAttributeList::create(Some(name), Some(0xFF20_4080)));
+
+        assert_eq!(
+            info,
+            TrackInfo {
+                name: Some(String::from("Kick Bus")),
+                color: Some(0xFF20_4080),
+            }
+        );
+    }
+
+    #[test]
+    fn track_info_sign_extended_color() {
+        // A host storing the ColorSpec as a signed 32-bit integer before widening it
+        let color = 0xFF20_4080u32 as i32 as i64;
+        let info = parse(TestAttributeList::create(None, Some(color)));
+
+        assert_eq!(info.name, None);
+        assert_eq!(info.color, Some(0xFF20_4080));
+    }
+
+    #[test]
+    fn track_info_empty_list() {
+        let info = parse(TestAttributeList::create(None, None));
+
+        assert_eq!(info, TrackInfo::default());
+    }
+
+    #[test]
+    fn track_info_empty_name_is_none() {
+        let info = parse(TestAttributeList::create(Some(vec![0]), None));
+
+        assert_eq!(info.name, None);
+    }
+
+    #[test]
+    fn track_info_unterminated_name_is_cut_off() {
+        let name = vec![b'a' as u16; TRACK_NAME_CAPACITY * 2];
+        let info = parse(TestAttributeList::create(Some(name), None));
+
+        assert_eq!(info.name, Some("a".repeat(TRACK_NAME_CAPACITY)));
+    }
+
+    #[test]
+    fn track_info_invalid_utf16_is_replaced() {
+        // A lone high surrogate
+        let name = vec![b'A' as u16, 0xD800, b'B' as u16, 0];
+        let info = parse(TestAttributeList::create(Some(name), None));
+
+        assert_eq!(info.name, Some(String::from("A\u{FFFD}B")));
+    }
+}
 
 #[cfg(test)]
 mod miri {
