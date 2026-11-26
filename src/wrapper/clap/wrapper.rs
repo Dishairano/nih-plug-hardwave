@@ -2197,7 +2197,10 @@ impl<P: ClapPlugin> Wrapper<P> {
                                 .enumerate()
                             {
                                 let aux_input_idx = aux_input_no + aux_input_start_idx;
-                                if aux_input_idx > process.audio_inputs_count as usize {
+                                // `audio_inputs` holds `audio_inputs_count` ports. `>` read
+                                // one port past the end when the host passed fewer ports
+                                // than the plug-in has.
+                                if aux_input_idx >= process.audio_inputs_count as usize {
                                     break;
                                 }
 
@@ -2221,7 +2224,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                                 .enumerate()
                             {
                                 let aux_output_idx = aux_output_no + aux_output_start_idx;
-                                if aux_output_idx > process.audio_outputs_count as usize {
+                                if aux_output_idx >= process.audio_outputs_count as usize {
                                     break;
                                 }
 

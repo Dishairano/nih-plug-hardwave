@@ -1295,7 +1295,14 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
                                     .enumerate()
                                 {
                                     let aux_input_idx = aux_input_no + aux_input_start_idx;
-                                    if aux_input_idx > data.num_outputs as usize {
+                                    // The host hands over `num_inputs` buses, and it need
+                                    // not hand over every bus the plug-in has: a host with
+                                    // no sidechain routing passes the main input alone.
+                                    // What sits behind those is the host's own memory. This
+                                    // compared against the number of *output* buses, and
+                                    // with `>`, so a bus that was never passed was read as
+                                    // an auxiliary input.
+                                    if aux_input_idx >= data.num_inputs.max(0) as usize {
                                         break;
                                     }
 
@@ -1319,7 +1326,8 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
                                     .enumerate()
                                 {
                                     let aux_output_idx = aux_output_no + aux_output_start_idx;
-                                    if aux_output_idx > data.num_outputs as usize {
+                                    // As for the inputs: `>` read one bus past the end.
+                                    if aux_output_idx >= data.num_outputs.max(0) as usize {
                                         break;
                                     }
 
